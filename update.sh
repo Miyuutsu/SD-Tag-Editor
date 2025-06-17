@@ -1,5 +1,6 @@
 #!/bin/bash
 
+git pull
 if [ -d "venv" ]; then
     source venv/bin/activate
 else
@@ -11,14 +12,7 @@ else
     exit 0
 fi
 
-while IFS== read -r key value; do
-    if [ "$value" == "true" ]; then
-        pip install -U -r requirements.txt --extra-index-url=https://download.pytorch.org/whl/cu121
-    else
-        pip install -U -r requirements.txt
-    fi
-done < config.txt
-
+uv pip install -r requirements.txt --extra-index-url=https://download.pytorch.org/whl/cu128
 read -p "Press enter to continue..."
 deactivate
 exit 0
