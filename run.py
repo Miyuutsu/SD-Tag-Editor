@@ -10,14 +10,15 @@ import torch
 import tqdm
 from huggingface_hub import hf_hub_download
 from huggingface_hub.utils import HfHubHTTPError
-from PIL import Image, UnidentifiedImageError
+from PIL import Image, ImageFile, UnidentifiedImageError
 from simple_parsing import field, parse_known_args
 from timm.data import create_transform, resolve_data_config
 from torch import Tensor, nn
 from torch.nn import functional as F
+ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 from tag_tree_functions import GroupTree, flatten_tags, load_groups, prune
-
+Image.MAX_IMAGE_PIXELS = None
 torch_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 MODEL_REPO_MAP = {
     "vit": "SmilingWolf/wd-vit-tagger-v3",
@@ -98,15 +99,21 @@ def load_labels_hf(
         character=list(np.where(df["category"] == 4)[0]),
     )
 
-
 def process_batch(batch: list[Path], transform) -> torch.Tensor:
-    img_inputs: list[Image.Image] = [Image.open(x) for x in batch]
-    img_inputs = [pil_ensure_rgb(img_input) for img_input in img_inputs]
-    img_inputs = [pil_pad_square(img_input) for img_input in img_inputs]
-    img_inputs: list[Tensor] = [transform(img_input).unsqueeze(0) for img_input in img_inputs]
-    img_inputs = [x[:, [2, 1, 0]] for x in img_inputs]
-    return torch.cat(img_inputs)
+    img_inputs: list[Image.Image] = []
+    for path in batch:
+        try:
+            img = Image.open(path)
+            img = pil_ensure_rgb(img)
+            img = pil_pad_square(img)
+            img_inputs.append(transform(img).unsqueeze(0)[:, [2, 1, 0]])
+        except (OSError, ValueError) as e:
+            print(f"[Warning] Skipping corrupted image: {path} ({e})")
+            continue
 
+    if not img_inputs:
+        raise RuntimeError("All images in batch failed to load.")
+    return torch.cat(img_inputs)
 
 def get_tags(
     probs: Tensor,
