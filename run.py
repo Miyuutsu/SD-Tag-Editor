@@ -281,11 +281,18 @@ def main(opts: ScriptOptions):
     init_worker(labels, group_tree, opts)
 
     # Switch to ThreadPool to prevent tensor IPC serialization locks
-    with ThreadPoolExecutor(max_workers=14) as executor:
-        for img_inputs, paths in tqdm(dataloader):
+    with ThreadPoolExecutor(
+    max_workers=14,
+    initializer=init_worker,
+    initargs=(labels, group_tree, opts)
+    ) as executor:
+
+        for img_inputs, paths in tqdm(dataloader): # tqdm is imported as tqdm in run_json, tqdm.tqdm in run
             outputs = run_model(model, img_inputs)
             tasks = [(img, paths[i]) for i, img in enumerate(outputs)]
-            list(executor.map(save_json_output, tasks))
+
+            # Threads share memory, eliminating PyTorch tensor pickling crashes
+            list(executor.map(save_json_output, tasks)) # Use save_txt_output for run.py
 
 if __name__ == "__main__":
     opts, _ = parse_known_args(ScriptOptions)

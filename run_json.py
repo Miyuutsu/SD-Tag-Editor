@@ -1,7 +1,7 @@
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from concurrent.futures import ThreadPoolExecutor # Change this import
+from concurrent.futures import ProcessPoolExecutor # Change this import
 import orjson
 from simple_parsing import parse_known_args
 from tqdm import tqdm
@@ -57,15 +57,14 @@ def save_json_output(args_tuple):
     )
     artist = []
 
-    # FIX: Cast PyTorch/NumPy scalars to native Python floats so orjson doesn't panic
-    char = {k: float(v) for k, v in char.items()}
-    rating = {k: float(v) for k, v in rating.items()}
-
-    # Prune the general tags to remove bloat, and cast to float
+    # FIX 1: Prune general tags to avoid database bloat
     pruned_gen_tuples = flatten_tags(prune(WORKER_GROUP_TREE, gen), True)
-    gen = {k: float(v) for k, v in pruned_gen_tuples}
 
-    # If sidecar exists, merge confidences (average them)
+    # FIX 2: Cast all PyTorch numpy.float32 scalars to native Python floats
+    char = {str(k): float(v) for k, v in char.items()}
+    gen = {str(k): float(v) for k, v in pruned_gen_tuples}
+    rating = {str(k): float(v) for k, v in rating.items()}
+
     if js.is_file():
         data = orjson.loads(js.read_bytes())
         for x in data.get("character", {}):
@@ -80,9 +79,7 @@ def save_json_output(args_tuple):
         "rating": rating,
         "artist": artist
     }
-
     js.write_bytes(orjson.dumps(output_data, option=orjson.OPT_INDENT_2))
-
 
 def main(opts: ScriptOptions):
     dataloader, model, labels, group_tree = setup(
@@ -93,11 +90,18 @@ def main(opts: ScriptOptions):
     init_worker(labels, group_tree, opts)
 
     # FIX: Use ThreadPoolExecutor to prevent deadlocks with PyTorch's DataLoader processes
-    with ThreadPoolExecutor(max_workers=14) as executor:
-        for img_inputs, paths in tqdm(dataloader):
+    with ProcessPoolExecutor(
+    max_workers=14,
+    initializer=init_worker,
+    initargs=(labels, group_tree, opts)
+    ) as executor:
+
+        for img_inputs, paths in tqdm(dataloader): # tqdm is imported as tqdm in run_json, tqdm.tqdm in run
             outputs = run_model(model, img_inputs)
             tasks = [(img, paths[i]) for i, img in enumerate(outputs)]
-            list(executor.map(save_json_output, tasks))
+
+            # Threads share memory, eliminating PyTorch tensor pickling crashes
+            list(executor.map(save_json_output, tasks)) # Use save_txt_output for run.py
 
 if __name__ == "__main__":
     opts, _ = parse_known_args(ScriptOptions)
