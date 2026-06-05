@@ -8,7 +8,7 @@ import pandas as pd
 import timm
 import torch
 import tqdm
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor
 from huggingface_hub import hf_hub_download
 from huggingface_hub.utils import HfHubHTTPError
 from PIL import Image, UnidentifiedImageError
@@ -281,7 +281,7 @@ def main(opts: ScriptOptions):
     init_worker(labels, group_tree, opts)
 
     # Switch to ThreadPool to prevent tensor IPC serialization locks
-    with ThreadPoolExecutor(
+    with ProcessPoolExecutor(
     max_workers=14,
     initializer=init_worker,
     initargs=(labels, group_tree, opts)
