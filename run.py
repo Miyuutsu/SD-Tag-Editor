@@ -8,6 +8,7 @@ import pandas as pd
 import timm
 import torch
 import tqdm
+from concurrent.futures import ThreadPoolExecutor
 from huggingface_hub import hf_hub_download
 from huggingface_hub.utils import HfHubHTTPError
 from PIL import Image, UnidentifiedImageError
@@ -15,6 +16,7 @@ from simple_parsing import field, parse_known_args
 from timm.data import create_transform, resolve_data_config
 from torch import Tensor, nn
 from torch.nn import functional as F
+from torch.utils.data import Dataset, DataLoader
 
 from tag_tree_functions import GroupTree, flatten_tags, load_groups, prune
 
@@ -27,6 +29,22 @@ MODEL_REPO_MAP = {
     "eva02": "SmilingWolf/wd-eva02-large-tagger-v3",
 }
 
+class TaggerDataset(Dataset):
+    def __init__(self, paths, transform):
+        self.paths = paths
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.paths)
+
+    def __getitem__(self, idx):
+        path = self.paths[idx]
+        img = Image.open(path)
+        img = pil_ensure_rgb(img)
+        img = pil_pad_square(img)
+        tensor = self.transform(img)
+        tensor = tensor[[2, 1, 0], :, :]  # BGR swap
+        return tensor, str(path)
 
 def list_files(path: Path) -> list[Path]:
     folders = [path]
@@ -99,13 +117,14 @@ def load_labels_hf(
     )
 
 
-def process_batch(batch: list[Path], transform) -> torch.Tensor:
-    img_inputs: list[Image.Image] = [Image.open(x) for x in batch]
-    img_inputs = [pil_ensure_rgb(img_input) for img_input in img_inputs]
-    img_inputs = [pil_pad_square(img_input) for img_input in img_inputs]
-    img_inputs: list[Tensor] = [transform(img_input).unsqueeze(0) for img_input in img_inputs]
-    img_inputs = [x[:, [2, 1, 0]] for x in img_inputs]
-    return torch.cat(img_inputs)
+def _process_single_image(img_path: Path, transform) -> torch.Tensor:
+    """Helper function to process a single image start-to-finish."""
+    img = Image.open(img_path)
+    img = pil_ensure_rgb(img)
+    img = pil_pad_square(img)
+    tensor = transform(img).unsqueeze(0)
+    tensor = tensor[:, [2, 1, 0]]  # BGR swap
+    return tensor
 
 
 def get_tags(
@@ -169,47 +188,33 @@ def load_images(image_path: Path, subfolder: bool) -> list[Path]:
     else:
         temp = [x for x in image_path.iterdir() if x.is_file()]
 
-    for file in temp:
-        try:
-            Image.open(file)
-            images.append(file)
-        except UnidentifiedImageError:
-            continue
+    images: list[Path] = [file for file in temp]
     return images
 
-
-def create_batches(images: list[Path], batch_size: int = 1) -> list[list[Path]]:
-    batches: list[list[Path]] = []
-    for _ in range(math.ceil(len(images) / batch_size)):
-        batches.append(images[:batch_size])
-        images = images[batch_size:]
-    return batches
-
-
-def run_model(model: nn.Module, transform, batch: list[Path]) -> list[torch.Tensor]:
-    img_inputs = process_batch(batch, transform)
+def run_model(model: nn.Module, img_inputs: torch.Tensor) -> list[torch.Tensor]:
+    """Runs inference without constantly reloading the model to CPU."""
     with torch.inference_mode():
         if torch.device.type != "cpu":
-            model = model.to(torch_device)
             img_inputs = img_inputs.to(torch_device)
         outputs = model.forward(img_inputs)
         outputs = F.sigmoid(outputs)
         if torch.device.type != "cpu":
-            img_inputs = img_inputs.to("cpu")
             outputs = outputs.to("cpu")
-            model = model.to("cpu")
+            # We explicitly removed model.to("cpu") here!
         outputs = torch.unbind(outputs, dim=0)
     return outputs
 
-
 def setup(
-    model: str, image_or_images: str, subfolder: bool, batch_size: int
-) -> tuple[list[list[Path]], nn.Module, LabelData, any, GroupTree]:
-    repo_id, image_path = prepare_inputs(model, image_or_images)
-    batches = create_batches(load_images(image_path, subfolder), batch_size)
+    model_name: str, image_or_images: str, subfolder: bool, batch_size: int
+):
+    repo_id, image_path = prepare_inputs(model_name, image_or_images)
+    image_paths = load_images(image_path, subfolder)
 
-    print(f"Loading model '{model}' from '{repo_id}'...")
+    print(f"Loading model '{model_name}' from '{repo_id}'...")
     model = load_model_hf(repo_id)
+    if torch.device.type != "cpu":
+        print("Moving model to GPU VRAM...")
+        model = model.to(torch_device) # Moved ONCE!
 
     print("Loading tag list...")
     labels: LabelData = load_labels_hf(repo_id=repo_id)
@@ -217,33 +222,70 @@ def setup(
     print("Creating data transform...")
     transform = create_transform(**resolve_data_config(model.pretrained_cfg, model=model))
 
+    print("Creating Multi-Core DataLoader...")
+    dataset = TaggerDataset(image_paths, transform)
+    # Using 8 CPU workers bypasses the GIL and continuously feeds the 4080
+    dataloader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        num_workers=8,
+        shuffle=False,
+        pin_memory=True,      # Locks memory for instant PCIe transfer
+        prefetch_factor=4     # Forces CPU to aggressively queue up batches
+    )
+
     print("Loading prune tag groups...")
     group_tree: GroupTree = load_groups()
-    return batches, model, labels, transform, group_tree
+
+    # Notice we return dataloader instead of batches, and we no longer need to pass transform
+    return dataloader, model, labels, group_tree
+
+
+# Global placeholders for the worker processes
+WORKER_LABELS = None
+WORKER_GROUP_TREE = None
+WORKER_OPTS = None
+
+def init_worker(labels, group_tree, opts):
+    """Initializes the heavy static data ONCE per background worker."""
+    global WORKER_LABELS, WORKER_GROUP_TREE, WORKER_OPTS
+    WORKER_LABELS = labels
+    WORKER_GROUP_TREE = group_tree
+    WORKER_OPTS = opts
+
+def save_txt_output(args_tuple):
+    """Worker function to process and save standard txt tags."""
+    img_tensor, path_str = args_tuple
+
+    char_labels, gen_labels, _ = get_tags(
+        probs=img_tensor, labels=WORKER_LABELS,
+        gen_threshold=WORKER_OPTS.gen_threshold, char_threshold=WORKER_OPTS.char_threshold
+    )
+    pruned = flatten_tags(prune(WORKER_GROUP_TREE, {str(x): float(y) for x, y in gen_labels.items()}), True)
+    pruned = [
+        x[0].replace("_", " ") if WORKER_OPTS.noUnderscores else x[0]
+        for x in sorted(pruned, key=lambda x: x[1], reverse=True)
+    ]
+    if WORKER_OPTS.sortAlphabetically:
+        pruned = sorted(pruned)
+    pruned = ", ".join([str(x) for x in char_labels] + pruned)
+    Path(path_str).with_suffix(".txt").write_text(pruned, encoding="utf-8")
 
 
 def main(opts: ScriptOptions):
-    batches, model, labels, transform, group_tree = setup(
+    dataloader, model, labels, group_tree = setup(
         opts.model, opts.image_or_images, opts.subfolder, opts.batch_size
     )
 
-    for batch in tqdm.tqdm(batches):
-        batch: list[Path]
-        outputs = run_model(model, transform, batch)
-        for i, img in enumerate(outputs):
-            char_labels, gen_labels, _ = get_tags(
-                probs=img, labels=labels, gen_threshold=opts.gen_threshold, char_threshold=opts.char_threshold
-            )
-            pruned = flatten_tags(prune(group_tree, {str(x): float(y) for x, y in gen_labels.items()}), True)
-            pruned = [
-                x[0].replace("_", " ") if opts.noUnderscores else x[0]
-                for x in sorted(pruned, key=lambda x: x[1], reverse=True)
-            ]
-            if opts.sortAlphabetically:
-                pruned = sorted(pruned)
-            pruned = ", ".join([str(x) for x in char_labels] + pruned)
-            batch[i].with_suffix(".txt").write_text(pruned, encoding="utf-8")
+    # Initialize globals locally since threads share the memory space
+    init_worker(labels, group_tree, opts)
 
+    # Switch to ThreadPool to prevent tensor IPC serialization locks
+    with ThreadPoolExecutor(max_workers=14) as executor:
+        for img_inputs, paths in tqdm(dataloader):
+            outputs = run_model(model, img_inputs)
+            tasks = [(img, paths[i]) for i, img in enumerate(outputs)]
+            list(executor.map(save_json_output, tasks))
 
 if __name__ == "__main__":
     opts, _ = parse_known_args(ScriptOptions)

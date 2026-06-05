@@ -1,6 +1,7 @@
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from concurrent.futures import ThreadPoolExecutor # Change this import
 import orjson
 from simple_parsing import parse_known_args
 from tqdm import tqdm
@@ -8,6 +9,17 @@ from tqdm import tqdm
 from run import MODEL_REPO_MAP, ScriptOptions, get_tags, run_model, setup
 from tag_tree_functions import GroupTree, flatten_tags, prune
 
+# Global placeholders for the worker processes
+WORKER_LABELS = None
+WORKER_GROUP_TREE = None
+WORKER_OPTS = None
+
+def init_worker(labels, group_tree, opts):
+    """Initializes the heavy static data ONCE per background worker."""
+    global WORKER_LABELS, WORKER_GROUP_TREE, WORKER_OPTS
+    WORKER_LABELS = labels
+    WORKER_GROUP_TREE = group_tree
+    WORKER_OPTS = opts
 
 @dataclass
 class Item:
@@ -15,7 +27,6 @@ class Item:
     general: list[str] = field(default_factory=lambda: [])
     artist: list[str] = field(default_factory=lambda: [])
     rating: dict[str, float] = field(default_factory=lambda: {})
-
 
 def process_tags(
     group_tree: GroupTree,
@@ -36,32 +47,57 @@ def process_tags(
         rating={str(x): float(y) for x, y in ratings.items()},
     )
 
+def save_json_output(args_tuple):
+    img_tensor, path_str = args_tuple
+    js = Path(path_str).with_suffix(".json")
+
+    char, gen, rating = get_tags(
+        probs=img_tensor, labels=WORKER_LABELS,
+        gen_threshold=WORKER_OPTS.gen_threshold, char_threshold=WORKER_OPTS.char_threshold
+    )
+    artist = []
+
+    # FIX: Cast PyTorch/NumPy scalars to native Python floats so orjson doesn't panic
+    char = {k: float(v) for k, v in char.items()}
+    rating = {k: float(v) for k, v in rating.items()}
+
+    # Prune the general tags to remove bloat, and cast to float
+    pruned_gen_tuples = flatten_tags(prune(WORKER_GROUP_TREE, gen), True)
+    gen = {k: float(v) for k, v in pruned_gen_tuples}
+
+    # If sidecar exists, merge confidences (average them)
+    if js.is_file():
+        data = orjson.loads(js.read_bytes())
+        for x in data.get("character", {}):
+            char[x] = (char.get(x, WORKER_OPTS.char_threshold) + WORKER_OPTS.char_threshold) / 2
+        for x in data.get("general", {}):
+            gen[x] = (gen.get(x, WORKER_OPTS.gen_threshold) + WORKER_OPTS.gen_threshold) / 2
+        artist = data.get("artist", [])
+
+    output_data = {
+        "character": char,
+        "general": gen,
+        "rating": rating,
+        "artist": artist
+    }
+
+    js.write_bytes(orjson.dumps(output_data, option=orjson.OPT_INDENT_2))
+
 
 def main(opts: ScriptOptions):
-    batches, model, labels, transform, group_tree = setup(
+    dataloader, model, labels, group_tree = setup(
         opts.model, opts.image_or_images, opts.subfolder, opts.batch_size
     )
-    for batch in tqdm(batches):
-        batch: list[Path]
-        outputs = run_model(model, transform, batch)
-        for i, img in enumerate(outputs):
-            js = batch[i].with_suffix(".json")
-            char, gen, rating = get_tags(
-                probs=img, labels=labels, gen_threshold=opts.gen_threshold, char_threshold=opts.char_threshold
-            )
-            artist = []
-            if js.is_file():
-                data = orjson.loads(js.read_bytes())
-                for x in data["character"]:
-                    char[x] = (char.get(x, opts.char_threshold) + opts.char_threshold) / 2
-                for x in data["general"]:
-                    gen[x] = (gen.get(x, opts.gen_threshold) + opts.gen_threshold) / 2
-                artist = data["artist"]
-            item = process_tags(
-                group_tree=group_tree, char_labels=char, gen_labels=gen, artists=artist, ratings=rating
-            )
-            batch[i].with_suffix(".json").write_bytes(orjson.dumps(item, option=orjson.OPT_INDENT_2))
 
+    # Initialize the globals in the main thread since Threads share memory space
+    init_worker(labels, group_tree, opts)
+
+    # FIX: Use ThreadPoolExecutor to prevent deadlocks with PyTorch's DataLoader processes
+    with ThreadPoolExecutor(max_workers=14) as executor:
+        for img_inputs, paths in tqdm(dataloader):
+            outputs = run_model(model, img_inputs)
+            tasks = [(img, paths[i]) for i, img in enumerate(outputs)]
+            list(executor.map(save_json_output, tasks))
 
 if __name__ == "__main__":
     opts, _ = parse_known_args(ScriptOptions)
