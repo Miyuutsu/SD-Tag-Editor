@@ -1,3 +1,4 @@
+# pylint: disable=duplicate-code,line-too-long,too-many-locals,too-many-branches,too-many-statements,too-many-arguments,too-many-positional-arguments,missing-function-docstring,missing-module-docstring,missing-class-docstring,no-member,c-extension-no-member
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -16,7 +17,7 @@ WORKER_OPTS = None
 
 def init_worker(labels, group_tree, opts):
     """Initializes the heavy static data ONCE per background worker."""
-    global WORKER_LABELS, WORKER_GROUP_TREE, WORKER_OPTS
+    global WORKER_LABELS, WORKER_GROUP_TREE, WORKER_OPTS # pylint: disable=global-statement
     WORKER_LABELS = labels
     WORKER_GROUP_TREE = group_tree
     WORKER_OPTS = opts
@@ -104,8 +105,8 @@ def main(opts: ScriptOptions):
             list(executor.map(save_json_output, tasks)) # Use save_txt_output for run.py
 
 if __name__ == "__main__":
-    opts, _ = parse_known_args(ScriptOptions)
-    if opts.model not in MODEL_REPO_MAP:
+    parsed_opts, _ = parse_known_args(ScriptOptions)
+    if parsed_opts.model not in MODEL_REPO_MAP:
         print(f"Available models: {list(MODEL_REPO_MAP.keys())}")
-        raise ValueError(f"Unknown model name '{opts.model}'")
-    main(opts)
+        raise ValueError(f"Unknown model name '{parsed_opts.model}'")
+    main(parsed_opts)

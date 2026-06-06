@@ -1,19 +1,20 @@
-import math
+# pylint # pylint: disable=duplicate-code,line-too-long,too-many-instance-attributes,too-many-locals,too-many-branches,too-many-statements,too-many-arguments,too-many-positional-arguments,missing-function-docstring,missing-module-docstring,missing-class-docstring
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
-
+from concurrent.futures import ProcessPoolExecutor
 import numpy as np
 import pandas as pd
 import timm
 import torch
-import tqdm
-from concurrent.futures import ProcessPoolExecutor
+
+
 from huggingface_hub import hf_hub_download
 from huggingface_hub.utils import HfHubHTTPError
 from PIL import Image, UnidentifiedImageError
 from simple_parsing import field, parse_known_args
 from timm.data import create_transform, resolve_data_config
+from tqdm import tqdm
 from torch import Tensor, nn
 from torch.nn import functional as F
 from torch.utils.data import Dataset, DataLoader
@@ -136,22 +137,22 @@ def get_tags(
     # Convert indices+probs to labels
     probs = list(zip(labels.names, probs.numpy()))
 
-    # General labels, pick any where prediction confidence > threshold
+    # General labels
     gen_labels = [probs[i] for i in labels.general]
-    gen_labels = dict([x for x in gen_labels if x[1] > gen_threshold])
+    gen_labels = {x[0]: x[1] for x in gen_labels if x[1] > gen_threshold}
     gen_labels = dict(sorted(gen_labels.items(), key=lambda item: item[1], reverse=True))
 
-    # Character labels, pick any where prediction confidence > threshold
+    # Character labels
     char_labels = [probs[i] for i in labels.character]
-    char_labels = dict([x for x in char_labels if x[1] > char_threshold])
+    char_labels = {x[0]: x[1] for x in char_labels if x[1] > char_threshold}
     char_labels = dict(sorted(char_labels.items(), key=lambda item: item[1], reverse=True))
 
     # rating labels
-    rating_labels = dict([probs[i] for i in labels.rating])
+    rating_labels = {probs[i][0]: probs[i][1] for i in labels.rating}
 
     return char_labels, gen_labels, rating_labels
 
-
+# pylint: disable=invalid-name
 @dataclass
 class ScriptOptions:
     image_or_images: str = field(positional=True, default="NO_INPUT")
@@ -188,18 +189,25 @@ def load_images(image_path: Path, subfolder: bool) -> list[Path]:
     else:
         temp = [x for x in image_path.iterdir() if x.is_file()]
 
-    images: list[Path] = [file for file in temp]
+    images: list[Path] = list(temp)
     return images
 
 def run_model(model: nn.Module, img_inputs: torch.Tensor) -> list[torch.Tensor]:
     """Runs inference without constantly reloading the model to CPU."""
     with torch.inference_mode():
         if torch.device.type != "cpu":
-            img_inputs = img_inputs.to(torch_device)
-        outputs = model.forward(img_inputs)
-        outputs = F.sigmoid(outputs)
+            img_inputs = img_inputs.to(
+                torch_device,
+                non_blocking=True,
+                memory_format=torch.channels_last
+            )
+
+        amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+        with torch.autocast(device_type=torch.device.type, dtype=amp_dtype):
+            outputs = model.forward(img_inputs)
+            outputs = F.sigmoid(outputs)
         if torch.device.type != "cpu":
-            outputs = outputs.to("cpu")
+            outputs = outputs.to("cpu", non_blocking=True)
             # We explicitly removed model.to("cpu") here!
         outputs = torch.unbind(outputs, dim=0)
     return outputs
@@ -214,7 +222,8 @@ def setup(
     model = load_model_hf(repo_id)
     if torch.device.type != "cpu":
         print("Moving model to GPU VRAM...")
-        model = model.to(torch_device) # Moved ONCE!
+        model = model.to(torch_device)
+        model = model.to(memory_format=torch.channels_last)
 
     print("Loading tag list...")
     labels: LabelData = load_labels_hf(repo_id=repo_id)
@@ -248,7 +257,7 @@ WORKER_OPTS = None
 
 def init_worker(labels, group_tree, opts):
     """Initializes the heavy static data ONCE per background worker."""
-    global WORKER_LABELS, WORKER_GROUP_TREE, WORKER_OPTS
+    global WORKER_LABELS, WORKER_GROUP_TREE, WORKER_OPTS # pylint: disable=global-statement
     WORKER_LABELS = labels
     WORKER_GROUP_TREE = group_tree
     WORKER_OPTS = opts
@@ -277,26 +286,26 @@ def main(opts: ScriptOptions):
         opts.model, opts.image_or_images, opts.subfolder, opts.batch_size
     )
 
-    # Initialize globals locally since threads share the memory space
+    # Initialize globals locally for the worker processes
     init_worker(labels, group_tree, opts)
 
-    # Switch to ThreadPool to prevent tensor IPC serialization locks
     with ProcessPoolExecutor(
-    max_workers=14,
-    initializer=init_worker,
-    initargs=(labels, group_tree, opts)
+        max_workers=14,
+        initializer=init_worker,
+        initargs=(labels, group_tree, opts)
     ) as executor:
 
-        for img_inputs, paths in tqdm(dataloader): # tqdm is imported as tqdm in run_json, tqdm.tqdm in run
+        # FIX 1: Use tqdm.tqdm for run.py
+        for img_inputs, paths in tqdm(dataloader):
             outputs = run_model(model, img_inputs)
             tasks = [(img, paths[i]) for i, img in enumerate(outputs)]
 
-            # Threads share memory, eliminating PyTorch tensor pickling crashes
-            list(executor.map(save_json_output, tasks)) # Use save_txt_output for run.py
+            # FIX 2: Use save_txt_output for standard text saving
+            list(executor.map(save_txt_output, tasks))
 
 if __name__ == "__main__":
-    opts, _ = parse_known_args(ScriptOptions)
-    if opts.model not in MODEL_REPO_MAP:
+    parsed_opts, _ = parse_known_args(ScriptOptions)
+    if parsed_opts.model not in MODEL_REPO_MAP:
         print(f"Available models: {list(MODEL_REPO_MAP.keys())}")
-        raise ValueError(f"Unknown model name '{opts.model}'")
-    main(opts)
+        raise ValueError(f"Unknown model name '{parsed_opts.model}'")
+    main(parsed_opts)
