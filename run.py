@@ -195,18 +195,16 @@ def load_images(image_path: Path, subfolder: bool) -> list[Path]:
 def run_model(model: nn.Module, img_inputs: torch.Tensor) -> list[torch.Tensor]:
     """Runs inference without constantly reloading the model to CPU."""
     with torch.inference_mode():
-        if torch.device.type != "cpu":
+        if torch_device.type != "cpu":
             img_inputs = img_inputs.to(
                 torch_device,
                 non_blocking=True,
                 memory_format=torch.channels_last
             )
 
-        amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-        with torch.autocast(device_type=torch.device.type, dtype=amp_dtype):
-            outputs = model.forward(img_inputs)
-            outputs = F.sigmoid(outputs)
-        if torch.device.type != "cpu":
+        outputs = model.forward(img_inputs)
+        outputs = F.sigmoid(outputs)
+        if torch_device.type != "cpu":
             outputs = outputs.to("cpu", non_blocking=True)
             # We explicitly removed model.to("cpu") here!
         outputs = torch.unbind(outputs, dim=0)
