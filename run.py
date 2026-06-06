@@ -18,6 +18,7 @@ from tqdm import tqdm
 from torch import Tensor, nn
 from torch.nn import functional as F
 from torch.utils.data import Dataset, DataLoader
+from torch.utils.data.dataloader import default_collate
 
 from tag_tree_functions import GroupTree, flatten_tags, load_groups, prune
 
@@ -40,12 +41,24 @@ class TaggerDataset(Dataset):
 
     def __getitem__(self, idx):
         path = self.paths[idx]
-        img = Image.open(path)
-        img = pil_ensure_rgb(img)
-        img = pil_pad_square(img)
-        tensor = self.transform(img)
-        tensor = tensor[[2, 1, 0], :, :]  # BGR swap
-        return tensor, str(path)
+        try:
+            img = Image.open(path)
+            img = pil_ensure_rgb(img)
+            img = pil_pad_square(img)
+            tensor = self.transform(img)
+            tensor = tensor[[2, 1, 0], :, :]  # BGR swap
+            return tensor, str(path)
+        except Exception as e:
+            # If the image is completely unreadable or corrupt, safely drop it
+            print(f"\n[WARNING] Skipping corrupt file: {path} - {e}")
+            return None
+
+def safe_collate(batch):
+    """Filters out corrupt images (None) before PyTorch builds the tensor batch."""
+    batch = [item for item in batch if item is not None]
+    if not batch: # If the entire batch was somehow corrupt
+        return torch.empty(0), []
+    return default_collate(batch)
 
 def list_files(path: Path) -> list[Path]:
     folders = [path]
@@ -238,7 +251,8 @@ def setup(
         num_workers=8,
         shuffle=False,
         pin_memory=True,      # Locks memory for instant PCIe transfer
-        prefetch_factor=4     # Forces CPU to aggressively queue up batches
+        prefetch_factor=4,
+        collate_fn=safe_collate
     )
 
     print("Loading prune tag groups...")
@@ -295,6 +309,8 @@ def main(opts: ScriptOptions):
 
         # FIX 1: Use tqdm.tqdm for run.py
         for img_inputs, paths in tqdm(dataloader):
+            if len(paths) == 0:
+                continue
             outputs = run_model(model, img_inputs)
             tasks = [(img, paths[i]) for i, img in enumerate(outputs)]
 

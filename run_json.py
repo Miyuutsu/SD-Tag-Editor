@@ -97,7 +97,9 @@ def main(opts: ScriptOptions):
     initargs=(labels, group_tree, opts)
     ) as executor:
 
-        for img_inputs, paths in tqdm(dataloader): # tqdm is imported as tqdm in run_json, tqdm.tqdm in run
+        for img_inputs, paths in tqdm(dataloader):
+            if len(paths) == 0:
+                continue
             outputs = run_model(model, img_inputs)
             tasks = [(img, paths[i]) for i, img in enumerate(outputs)]
 
