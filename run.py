@@ -49,21 +49,18 @@ class TaggerDataset(Dataset):
             tensor = tensor[[2, 1, 0], :, :]  # BGR swap
             return tensor, str(path)
         except Exception as e:
-            # If the image is completely unreadable or corrupt, safely drop it
             print(f"\n[WARNING] Skipping corrupt file: {path} - {e}")
             return None
 
 def safe_collate(batch):
-    """Filters out corrupt images (None) before PyTorch builds the tensor batch."""
     batch = [item for item in batch if item is not None]
-    if not batch: # If the entire batch was somehow corrupt
+    if not batch:
         return torch.empty(0), []
     return default_collate(batch)
 
 def list_files(path: Path) -> list[Path]:
     folders = [path]
     files = []
-
     while folders:
         folder = folders.pop(0)
         for file in folder.iterdir():
@@ -75,10 +72,8 @@ def list_files(path: Path) -> list[Path]:
 
 
 def pil_ensure_rgb(image: Image.Image) -> Image.Image:
-    # convert to RGB/RGBA if not already (deals with palette images etc.)
     if image.mode not in ["RGB", "RGBA"]:
         image = image.convert("RGBA") if "transparency" in image.info else image.convert("RGB")
-    # convert RGBA to RGB with white background
     if image.mode == "RGBA":
         canvas = Image.new("RGBA", image.size, (255, 255, 255))
         canvas.alpha_composite(image)
@@ -88,9 +83,7 @@ def pil_ensure_rgb(image: Image.Image) -> Image.Image:
 
 def pil_pad_square(image: Image.Image) -> Image.Image:
     w, h = image.size
-    # get the largest dimension so we can pad to a square
     px = max(image.size)
-    # pad to square with white background
     canvas = Image.new("RGB", (px, px), (255, 255, 255))
     canvas.paste(image, ((px - w) // 2, (px - h) // 2))
     return canvas
@@ -132,12 +125,11 @@ def load_labels_hf(
 
 
 def _process_single_image(img_path: Path, transform) -> torch.Tensor:
-    """Helper function to process a single image start-to-finish."""
     img = Image.open(img_path)
     img = pil_ensure_rgb(img)
     img = pil_pad_square(img)
     tensor = transform(img).unsqueeze(0)
-    tensor = tensor[:, [2, 1, 0]]  # BGR swap
+    tensor = tensor[:, [2, 1, 0]]
     return tensor
 
 
@@ -147,25 +139,20 @@ def get_tags(
     gen_threshold: float,
     char_threshold: float,
 ):
-    # Convert indices+probs to labels
     probs = list(zip(labels.names, probs.numpy()))
 
-    # General labels
     gen_labels = [probs[i] for i in labels.general]
     gen_labels = {x[0]: x[1] for x in gen_labels if x[1] > gen_threshold}
     gen_labels = dict(sorted(gen_labels.items(), key=lambda item: item[1], reverse=True))
 
-    # Character labels
     char_labels = [probs[i] for i in labels.character]
     char_labels = {x[0]: x[1] for x in char_labels if x[1] > char_threshold}
     char_labels = dict(sorted(char_labels.items(), key=lambda item: item[1], reverse=True))
 
-    # rating labels
     rating_labels = {probs[i][0]: probs[i][1] for i in labels.rating}
 
     return char_labels, gen_labels, rating_labels
 
-# pylint: disable=invalid-name
 @dataclass
 class ScriptOptions:
     image_or_images: str = field(positional=True, default="NO_INPUT")
@@ -176,6 +163,9 @@ class ScriptOptions:
     subfolder: bool = field(default=False)
     noUnderscores: bool = field(default=True)
     sortAlphabetically: bool = field(default=False)
+    # --- New Orchestration Flags ---
+    tag_prefix: str = field(default="")
+    dir_as_artist: bool = field(default=False)
 
 
 def prepare_inputs(model: str, image_or_images: str) -> tuple[str | None, Path | None]:
@@ -206,7 +196,6 @@ def load_images(image_path: Path, subfolder: bool) -> list[Path]:
     return images
 
 def run_model(model: nn.Module, img_inputs: torch.Tensor) -> list[torch.Tensor]:
-    """Runs inference without constantly reloading the model to CPU."""
     with torch.inference_mode():
         if torch_device.type != "cpu":
             img_inputs = img_inputs.to(
@@ -219,7 +208,6 @@ def run_model(model: nn.Module, img_inputs: torch.Tensor) -> list[torch.Tensor]:
         outputs = F.sigmoid(outputs)
         if torch_device.type != "cpu":
             outputs = outputs.to("cpu", non_blocking=True)
-            # We explicitly removed model.to("cpu") here!
         outputs = torch.unbind(outputs, dim=0)
     return outputs
 
@@ -244,13 +232,12 @@ def setup(
 
     print("Creating Multi-Core DataLoader...")
     dataset = TaggerDataset(image_paths, transform)
-    # Using 8 CPU workers bypasses the GIL and continuously feeds the 4080
     dataloader = DataLoader(
         dataset,
         batch_size=batch_size,
         num_workers=8,
         shuffle=False,
-        pin_memory=True,      # Locks memory for instant PCIe transfer
+        pin_memory=True,
         prefetch_factor=4,
         collate_fn=safe_collate
     )
@@ -258,39 +245,58 @@ def setup(
     print("Loading prune tag groups...")
     group_tree: GroupTree = load_groups()
 
-    # Notice we return dataloader instead of batches, and we no longer need to pass transform
     return dataloader, model, labels, group_tree
 
-
-# Global placeholders for the worker processes
 WORKER_LABELS = None
 WORKER_GROUP_TREE = None
 WORKER_OPTS = None
 
 def init_worker(labels, group_tree, opts):
-    """Initializes the heavy static data ONCE per background worker."""
     global WORKER_LABELS, WORKER_GROUP_TREE, WORKER_OPTS # pylint: disable=global-statement
     WORKER_LABELS = labels
     WORKER_GROUP_TREE = group_tree
     WORKER_OPTS = opts
 
 def save_txt_output(args_tuple):
-    """Worker function to process and save standard txt tags."""
+    """Worker function to process and save standard txt tags with prefixing logic."""
     img_tensor, path_str = args_tuple
+    img_path = Path(path_str)
+    real_path = img_path.resolve() # Resolves the symlink to find the true parent directory
 
     char_labels, gen_labels, _ = get_tags(
         probs=img_tensor, labels=WORKER_LABELS,
         gen_threshold=WORKER_OPTS.gen_threshold, char_threshold=WORKER_OPTS.char_threshold
     )
     pruned = flatten_tags(prune(WORKER_GROUP_TREE, {str(x): float(y) for x, y in gen_labels.items()}), True)
-    pruned = [
+
+    # Format text
+    pruned_formatted = [
         x[0].replace("_", " ") if WORKER_OPTS.noUnderscores else x[0]
         for x in sorted(pruned, key=lambda x: x[1], reverse=True)
     ]
     if WORKER_OPTS.sortAlphabetically:
-        pruned = sorted(pruned)
-    pruned = ", ".join([str(x) for x in char_labels] + pruned)
-    Path(path_str).with_suffix(".txt").write_text(pruned, encoding="utf-8")
+        pruned_formatted = sorted(pruned_formatted)
+
+    final_tags = []
+
+    # 1. Inject Human-Verified Directory Artist (Never shadow prefixed)
+    if WORKER_OPTS.dir_as_artist:
+        artist_name = real_path.parent.name.lower().replace(" ", "_")
+        if WORKER_OPTS.noUnderscores:
+            artist_name = artist_name.replace("_", " ")
+        final_tags.append(f"artist:{artist_name}")
+
+    # 2. Append AI Characters
+    for c in char_labels.keys():
+        char_tag = c.replace("_", " ") if WORKER_OPTS.noUnderscores else c
+        final_tags.append(f"{WORKER_OPTS.tag_prefix}{char_tag}")
+
+    # 3. Append AI General Tags
+    for g in pruned_formatted:
+        final_tags.append(f"{WORKER_OPTS.tag_prefix}{g}")
+
+    pruned_str = ", ".join(final_tags)
+    img_path.with_suffix(".txt").write_text(pruned_str, encoding="utf-8")
 
 
 def main(opts: ScriptOptions):
@@ -298,7 +304,6 @@ def main(opts: ScriptOptions):
         opts.model, opts.image_or_images, opts.subfolder, opts.batch_size
     )
 
-    # Initialize globals locally for the worker processes
     init_worker(labels, group_tree, opts)
 
     with ProcessPoolExecutor(
@@ -307,14 +312,12 @@ def main(opts: ScriptOptions):
         initargs=(labels, group_tree, opts)
     ) as executor:
 
-        # FIX 1: Use tqdm.tqdm for run.py
         for img_inputs, paths in tqdm(dataloader):
             if len(paths) == 0:
                 continue
             outputs = run_model(model, img_inputs)
             tasks = [(img, paths[i]) for i, img in enumerate(outputs)]
 
-            # FIX 2: Use save_txt_output for standard text saving
             list(executor.map(save_txt_output, tasks))
 
 if __name__ == "__main__":

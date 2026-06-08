@@ -2,7 +2,7 @@
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from concurrent.futures import ProcessPoolExecutor # Change this import
+from concurrent.futures import ProcessPoolExecutor
 import orjson
 from simple_parsing import parse_known_args
 from tqdm import tqdm
@@ -10,13 +10,11 @@ from tqdm import tqdm
 from run import MODEL_REPO_MAP, ScriptOptions, get_tags, run_model, setup
 from tag_tree_functions import GroupTree, flatten_tags, prune
 
-# Global placeholders for the worker processes
 WORKER_LABELS = None
 WORKER_GROUP_TREE = None
 WORKER_OPTS = None
 
 def init_worker(labels, group_tree, opts):
-    """Initializes the heavy static data ONCE per background worker."""
     global WORKER_LABELS, WORKER_GROUP_TREE, WORKER_OPTS # pylint: disable=global-statement
     WORKER_LABELS = labels
     WORKER_GROUP_TREE = group_tree
@@ -51,6 +49,7 @@ def process_tags(
 def save_json_output(args_tuple):
     img_tensor, path_str = args_tuple
     js = Path(path_str).with_suffix(".json")
+    real_path = Path(path_str).resolve()
 
     char, gen, rating = get_tags(
         probs=img_tensor, labels=WORKER_LABELS,
@@ -58,13 +57,18 @@ def save_json_output(args_tuple):
     )
     artist = []
 
-    # FIX 1: Prune general tags to avoid database bloat
     pruned_gen_tuples = flatten_tags(prune(WORKER_GROUP_TREE, gen), True)
 
-    # FIX 2: Cast all PyTorch numpy.float32 scalars to native Python floats
-    char = {str(k): float(v) for k, v in char.items()}
-    gen = {str(k): float(v) for k, v in pruned_gen_tuples}
+    # Apply Optional Prefixes
+    prefix = WORKER_OPTS.tag_prefix
+    char = {f"{prefix}{str(k)}": float(v) for k, v in char.items()}
+    gen = {f"{prefix}{str(k)}": float(v) for k, v in pruned_gen_tuples}
     rating = {str(k): float(v) for k, v in rating.items()}
+
+    # Append the un-prefixed artist tag
+    if WORKER_OPTS.dir_as_artist:
+        artist_name = real_path.parent.name.lower().replace(" ", "_")
+        artist.append(artist_name)
 
     if js.is_file():
         data = orjson.loads(js.read_bytes())
@@ -72,7 +76,11 @@ def save_json_output(args_tuple):
             char[x] = (char.get(x, WORKER_OPTS.char_threshold) + WORKER_OPTS.char_threshold) / 2
         for x in data.get("general", {}):
             gen[x] = (gen.get(x, WORKER_OPTS.gen_threshold) + WORKER_OPTS.gen_threshold) / 2
-        artist = data.get("artist", [])
+
+        existing_artist = data.get("artist", [])
+        for a in existing_artist:
+            if a not in artist:
+                artist.append(a)
 
     output_data = {
         "character": char,
@@ -87,14 +95,12 @@ def main(opts: ScriptOptions):
         opts.model, opts.image_or_images, opts.subfolder, opts.batch_size
     )
 
-    # Initialize the globals in the main thread since Threads share memory space
     init_worker(labels, group_tree, opts)
 
-    # FIX: Use ThreadPoolExecutor to prevent deadlocks with PyTorch's DataLoader processes
     with ProcessPoolExecutor(
-    max_workers=14,
-    initializer=init_worker,
-    initargs=(labels, group_tree, opts)
+        max_workers=14,
+        initializer=init_worker,
+        initargs=(labels, group_tree, opts)
     ) as executor:
 
         for img_inputs, paths in tqdm(dataloader):
@@ -103,8 +109,7 @@ def main(opts: ScriptOptions):
             outputs = run_model(model, img_inputs)
             tasks = [(img, paths[i]) for i, img in enumerate(outputs)]
 
-            # Threads share memory, eliminating PyTorch tensor pickling crashes
-            list(executor.map(save_json_output, tasks)) # Use save_txt_output for run.py
+            list(executor.map(save_json_output, tasks))
 
 if __name__ == "__main__":
     parsed_opts, _ = parse_known_args(ScriptOptions)
