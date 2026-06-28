@@ -1,7 +1,5 @@
-# pylint # pylint: disable=duplicate-code,line-too-long,too-many-instance-attributes,too-many-locals,too-many-branches,too-many-statements,too-many-arguments,too-many-positional-arguments,missing-function-docstring,missing-module-docstring,missing-class-docstring
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
 from concurrent.futures import ProcessPoolExecutor
 import numpy as np
 import pandas as pd
@@ -10,10 +8,12 @@ import torch
 
 
 from huggingface_hub import hf_hub_download
-from huggingface_hub.utils import HfHubHTTPError
+from huggingface_hub.errors import HfHubHTTPError
 from PIL import Image, UnidentifiedImageError
 from simple_parsing import field, parse_known_args
-from timm.data import create_transform, resolve_data_config
+from timm.data.config import resolve_data_config
+from timm.data.transforms_factory import create_transform
+from torch.cuda import err
 from tqdm import tqdm
 from torch import Tensor, nn
 from torch.nn import functional as F
@@ -98,7 +98,7 @@ class LabelData:
 
 
 def load_model_hf(repo_id: str) -> nn.Module:
-    model: nn.Module = timm.create_model(f"hf-hub:{repo_id}").eval()
+    model = timm.create_model(f"hf-hub:{repo_id}").eval()
     state_dict = timm.models.load_state_dict_from_hf(repo_id)
     model.load_state_dict(state_dict)
     return model
@@ -106,8 +106,8 @@ def load_model_hf(repo_id: str) -> nn.Module:
 
 def load_labels_hf(
     repo_id: str,
-    revision: Optional[str] = None,
-    token: Optional[str] = None,
+    revision: str | None = None,
+    token: str | None = None,
 ) -> LabelData:
     try:
         csv_path = hf_hub_download(repo_id=repo_id, filename="selected_tags.csv", revision=revision, token=token)
@@ -123,33 +123,23 @@ def load_labels_hf(
         character=list(np.where(df["category"] == 4)[0]),
     )
 
-
-def _process_single_image(img_path: Path, transform) -> torch.Tensor:
-    img = Image.open(img_path)
-    img = pil_ensure_rgb(img)
-    img = pil_pad_square(img)
-    tensor = transform(img).unsqueeze(0)
-    tensor = tensor[:, [2, 1, 0]]
-    return tensor
-
-
 def get_tags(
     probs: Tensor,
     labels: LabelData,
     gen_threshold: float,
     char_threshold: float,
 ):
-    probs = list(zip(labels.names, probs.numpy()))
+    prob_results = list(zip(labels.names, probs.numpy(), strict=True))
 
-    gen_labels = [probs[i] for i in labels.general]
+    gen_labels = [prob_results[i] for i in labels.general]
     gen_labels = {x[0]: x[1] for x in gen_labels if x[1] > gen_threshold}
     gen_labels = dict(sorted(gen_labels.items(), key=lambda item: item[1], reverse=True))
 
-    char_labels = [probs[i] for i in labels.character]
+    char_labels = [prob_results[i] for i in labels.character]
     char_labels = {x[0]: x[1] for x in char_labels if x[1] > char_threshold}
     char_labels = dict(sorted(char_labels.items(), key=lambda item: item[1], reverse=True))
 
-    rating_labels = {probs[i][0]: probs[i][1] for i in labels.rating}
+    rating_labels = {prob_results[i][0]: prob_results[i][1] for i in labels.rating}
 
     return char_labels, gen_labels, rating_labels
 
@@ -163,13 +153,16 @@ class ScriptOptions:
     subfolder: bool = field(default=False)
     noUnderscores: bool = field(default=True)
     sortAlphabetically: bool = field(default=False)
-    # --- New Orchestration Flags ---
     tag_prefix: str = field(default="")
     dir_as_artist: bool = field(default=False)
 
 
-def prepare_inputs(model: str, image_or_images: str) -> tuple[str | None, Path | None]:
-    repo_id = MODEL_REPO_MAP.get(model)
+def prepare_inputs(model: str, image_or_images: str) -> tuple[str, Path]:
+    try:
+        repo_id = MODEL_REPO_MAP[model]
+    except KeyError:
+        print(f"Available models: {list(MODEL_REPO_MAP.keys())}")
+        raise ValueError(f"Unknown model name '{model}'") from err
     image_path = Path(image_or_images.strip(' "'))
     if image_path.name == "NO_INPUT":
         image_path = Path(input("Input folder or image: ").strip(' "'))
@@ -186,12 +179,7 @@ def load_images(image_path: Path, subfolder: bool) -> list[Path]:
         except UnidentifiedImageError as e:
             raise UnidentifiedImageError(f"Unknown File Type of image: {image_path}") from e
 
-    images: list[Path] = []
-    if subfolder:
-        temp = list_files(image_path)
-    else:
-        temp = [x for x in image_path.iterdir() if x.is_file()]
-
+    temp = list_files(image_path) if subfolder else [x for x in image_path.iterdir() if x.is_file()]
     images: list[Path] = list(temp)
     return images
 
@@ -200,29 +188,34 @@ def run_model(model: nn.Module, img_inputs: torch.Tensor) -> list[torch.Tensor]:
         if torch_device.type != "cpu":
             img_inputs = img_inputs.to(
                 torch_device,
-                non_blocking=True,
-                memory_format=torch.channels_last
+                non_blocking=True
             )
 
-        outputs = model.forward(img_inputs)
-        outputs = F.sigmoid(outputs)
+        # 1. Raw Scores/Logits (Initial assignment)
+        raw_outputs = model.forward(img_inputs)
+
+        # 2. Convert to probabilities (Semantic transformation)
+        probabilistic_outputs = F.sigmoid(raw_outputs)
+
+        cpu_outputs = probabilistic_outputs
         if torch_device.type != "cpu":
-            outputs = outputs.to("cpu", non_blocking=True)
-        outputs = torch.unbind(outputs, dim=0)
-    return outputs
+            # 3. Move data location (Memory transformation)
+            cpu_outputs = probabilistic_outputs.to("cpu", non_blocking=True)
+
+    # Return the list of tensors
+    return list(torch.unbind(cpu_outputs, dim=0))
+
 
 def setup(
     model_name: str, image_or_images: str, subfolder: bool, batch_size: int
 ):
     repo_id, image_path = prepare_inputs(model_name, image_or_images)
     image_paths = load_images(image_path, subfolder)
-
-    print(f"Loading model '{model_name}' from '{repo_id}'...")
     model = load_model_hf(repo_id)
-    if torch.device.type != "cpu":
+
+    if torch_device.type != "cpu":
         print("Moving model to GPU VRAM...")
         model = model.to(torch_device)
-        model = model.to(memory_format=torch.channels_last)
 
     print("Loading tag list...")
     labels: LabelData = load_labels_hf(repo_id=repo_id)
@@ -247,12 +240,12 @@ def setup(
 
     return dataloader, model, labels, group_tree
 
-WORKER_LABELS = None
-WORKER_GROUP_TREE = None
-WORKER_OPTS = None
+WORKER_LABELS: LabelData
+WORKER_GROUP_TREE: GroupTree
+WORKER_OPTS: ScriptOptions
 
 def init_worker(labels, group_tree, opts):
-    global WORKER_LABELS, WORKER_GROUP_TREE, WORKER_OPTS # pylint: disable=global-statement
+    global WORKER_LABELS, WORKER_GROUP_TREE, WORKER_OPTS
     WORKER_LABELS = labels
     WORKER_GROUP_TREE = group_tree
     WORKER_OPTS = opts
@@ -271,7 +264,7 @@ def save_txt_output(args_tuple):
 
     # Format text
     pruned_formatted = [
-        x[0].replace("_", " ") if WORKER_OPTS.noUnderscores else x[0]
+        str(x[0]).replace("_", " ") if WORKER_OPTS.noUnderscores else str(x[0])
         for x in sorted(pruned, key=lambda x: x[1], reverse=True)
     ]
     if WORKER_OPTS.sortAlphabetically:
@@ -287,7 +280,7 @@ def save_txt_output(args_tuple):
         final_tags.append(f"artist:{artist_name}")
 
     # 2. Append AI Characters
-    for c in char_labels.keys():
+    for c in char_labels:
         char_tag = c.replace("_", " ") if WORKER_OPTS.noUnderscores else c
         final_tags.append(f"{WORKER_OPTS.tag_prefix}{char_tag}")
 
@@ -322,7 +315,5 @@ def main(opts: ScriptOptions):
 
 if __name__ == "__main__":
     parsed_opts, _ = parse_known_args(ScriptOptions)
-    if parsed_opts.model not in MODEL_REPO_MAP:
-        print(f"Available models: {list(MODEL_REPO_MAP.keys())}")
-        raise ValueError(f"Unknown model name '{parsed_opts.model}'")
+    assert isinstance(parsed_opts, ScriptOptions)
     main(parsed_opts)

@@ -206,9 +206,8 @@ def build_tag_tree(groups: GroupTree, tags: dict[str, float]) -> ScoredGroupTree
         if category is None:
             output_tree[root_key][group_key].append(tag)
             continue
-        else:
-            output_tree[root_key][group_key].update(tag, category)
-            continue
+        output_tree[root_key][group_key].update(tag, category)
+        continue
 
     return output_tree
 
@@ -304,8 +303,7 @@ def prune_base(
         case 1:
             if tag_list[0].name == group_name and has_mod:
                 return []
-            else:
-                return tag_list
+            return tag_list
         case _:
             pass
 
@@ -333,8 +331,7 @@ def flatten_tags(
 
     if with_probs:
         return tags
-    else:
-        return [x.name for x in tags]
+    return [x.name for x in tags]
 
 
 def prune(

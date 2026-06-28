@@ -1,4 +1,3 @@
-# pylint: disable=duplicate-code,line-too-long,too-many-locals,too-many-branches,too-many-statements,too-many-arguments,too-many-positional-arguments,missing-function-docstring,missing-module-docstring,missing-class-docstring,no-member,c-extension-no-member
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -7,12 +6,12 @@ import orjson
 from simple_parsing import parse_known_args
 from tqdm import tqdm
 
-from run import MODEL_REPO_MAP, ScriptOptions, get_tags, run_model, setup
+from run import ScriptOptions, LabelData, get_tags, run_model, setup
 from tag_tree_functions import GroupTree, flatten_tags, prune
 
-WORKER_LABELS = None
-WORKER_GROUP_TREE = None
-WORKER_OPTS = None
+WORKER_LABELS: LabelData
+WORKER_GROUP_TREE: GroupTree
+WORKER_OPTS: ScriptOptions
 
 def init_worker(labels, group_tree, opts):
     global WORKER_LABELS, WORKER_GROUP_TREE, WORKER_OPTS # pylint: disable=global-statement
@@ -32,16 +31,15 @@ def process_tags(
     char_labels: dict[str, float],
     gen_labels: dict[str, float],
     ratings: dict[str, float],
-    artists: list[str] = None,
+    artists: list[str],
 ) -> Item:
-    if artists is None:
-        artists = []
-    char_labels = list(char_labels.keys())
-    gen_labels = flatten_tags(prune(group_tree, dict(gen_labels)), True)
-    gen_labels = [x[0] for x in sorted(gen_labels, key=lambda x: x[1], reverse=True)]
+    char_list = list(char_labels.keys())
+    pruned_gen_tuples = flatten_tags(prune(group_tree, gen_labels), True)
+    gen_list = [str(x[0]) for x in sorted(pruned_gen_tuples, key=lambda x: x[1], reverse=True)]
+
     return Item(
-        character=char_labels,
-        general=gen_labels,
+        character=char_list,
+        general=gen_list,
         artist=artists,
         rating={str(x): float(y) for x, y in ratings.items()},
     )
@@ -113,7 +111,5 @@ def main(opts: ScriptOptions):
 
 if __name__ == "__main__":
     parsed_opts, _ = parse_known_args(ScriptOptions)
-    if parsed_opts.model not in MODEL_REPO_MAP:
-        print(f"Available models: {list(MODEL_REPO_MAP.keys())}")
-        raise ValueError(f"Unknown model name '{parsed_opts.model}'")
+    assert isinstance(parsed_opts, ScriptOptions)
     main(parsed_opts)
