@@ -1,4 +1,4 @@
-import json
+import orjson
 import os
 import sys
 from collections import UserDict
@@ -341,8 +341,7 @@ def prune(
     if isinstance(tags, dict):
         tags = [ScoredTag(name, score) for name, score in tags.items()]
     tag_tree = build_tag_tree(groups, tags)
-    pruned = prune_tags(tag_tree)
-    return pruned
+    return prune_tags(tag_tree)
 
 
 def main(debug: bool = True):
@@ -355,7 +354,7 @@ def main(debug: bool = True):
     for tfile in input_files:
         out_file = output_dir.joinpath(tfile.name)
         # load tags
-        tags = json.loads(tfile.read_text(encoding="utf-8"))
+        tags = orjson.loads(tfile.read_text(encoding="utf-8"))
 
         # build and prune tag tree
         pruned = prune(group_tree, tags)

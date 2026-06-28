@@ -2,13 +2,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from concurrent.futures import ProcessPoolExecutor
 import numpy as np
+import orjson
 import pandas as pd
 import timm
 import torch
 
-
-from huggingface_hub import hf_hub_download
-from huggingface_hub.errors import HfHubHTTPError
+from huggingface_hub import hf_hub_download, constants
+from huggingface_hub.errors import HfHubHTTPError, LocalEntryNotFoundError
 from PIL import Image, UnidentifiedImageError
 from simple_parsing import field, parse_known_args
 from timm.data.config import resolve_data_config
@@ -97,11 +97,20 @@ class LabelData:
 
 
 def load_model_hf(repo_id: str) -> nn.Module:
-    model = timm.create_model(f"hf-hub:{repo_id}").eval()
-    state_dict = timm.models.load_state_dict_from_hf(repo_id)
-    model.load_state_dict(state_dict)
-    return model
+    try:
+        constants.HF_HUB_OFFLINE = True
+        model = timm.create_model(f"hf-hub:{repo_id}", pretrained=True).eval()
 
+    except Exception as e:
+        print(f"[INFO] Cache miss or error: {e}")
+        print(f"Downloading model weights for {repo_id}...")
+        constants.HF_HUB_OFFLINE = False
+        model = timm.create_model(f"hf-hub:{repo_id}", pretrained=True).eval()
+
+    finally:
+        constants.HF_HUB_OFFLINE = False
+
+    return model
 
 def load_labels_hf(
     repo_id: str,
@@ -109,11 +118,20 @@ def load_labels_hf(
     token: str | None = None,
 ) -> LabelData:
     try:
-        csv_path = hf_hub_download(repo_id=repo_id, filename="selected_tags.csv", revision=revision, token=token)
-        csv_path = Path(csv_path).resolve()
-    except HfHubHTTPError as e:
-        raise FileNotFoundError(f"selected_tags.csv failed to download from {repo_id}") from e
+        csv_path = hf_hub_download(
+            repo_id=repo_id, filename="selected_tags.csv", revision=revision,
+            token=token, local_files_only=True
+        )
+    except (LocalEntryNotFoundError, FileNotFoundError):
+        try:
+            print(f"Downloading tags for {repo_id}...")
+            csv_path = hf_hub_download(
+                repo_id=repo_id, filename="selected_tags.csv", revision=revision, token=token
+            )
+        except HfHubHTTPError as e:
+            raise FileNotFoundError(f"selected_tags.csv failed to download from {repo_id}") from e
 
+    csv_path = Path(csv_path).resolve()
     df: pd.DataFrame = pd.read_csv(csv_path, usecols=["name", "category"])
     return LabelData(
         names=df["name"].tolist(),
@@ -154,6 +172,7 @@ class ScriptOptions:
     sortAlphabetically: bool = field(default=False)
     tag_prefix: str = field(default="")
     dir_as_artist: bool = field(default=False)
+    output_json: bool = field(default=False)
 
 
 def prepare_inputs(model: str, image_or_images: str) -> tuple[str, Path]:
@@ -290,6 +309,49 @@ def save_txt_output(args_tuple):
     pruned_str = ", ".join(final_tags)
     img_path.with_suffix(".txt").write_text(pruned_str, encoding="utf-8")
 
+def save_json_output(args_tuple):
+    img_tensor, path_str = args_tuple
+    js = Path(path_str).with_suffix(".json")
+    real_path = Path(path_str).resolve()
+
+    char, gen, rating = get_tags(
+        probs=img_tensor, labels=WORKER_LABELS,
+        gen_threshold=WORKER_OPTS.gen_threshold, char_threshold=WORKER_OPTS.char_threshold
+    )
+    artist = []
+
+    pruned_gen_tuples = flatten_tags(prune(WORKER_GROUP_TREE, gen), True)
+
+    # Apply Optional Prefixes
+    prefix = WORKER_OPTS.tag_prefix
+    char = {f"{prefix}{str(k)}": float(v) for k, v in char.items()}
+    gen = {f"{prefix}{str(k)}": float(v) for k, v in pruned_gen_tuples}
+    rating = {str(k): float(v) for k, v in rating.items()}
+
+    # Append the un-prefixed artist tag
+    if WORKER_OPTS.dir_as_artist:
+        artist_name = real_path.parent.name.lower().replace(" ", "_")
+        artist.append(artist_name)
+
+    if js.is_file():
+        data = orjson.loads(js.read_bytes())
+        for x in data.get("character", {}):
+            char[x] = (char.get(x, WORKER_OPTS.char_threshold) + WORKER_OPTS.char_threshold) / 2
+        for x in data.get("general", {}):
+            gen[x] = (gen.get(x, WORKER_OPTS.gen_threshold) + WORKER_OPTS.gen_threshold) / 2
+
+        existing_artist = data.get("artist", [])
+        for a in existing_artist:
+            if a not in artist:
+                artist.append(a)
+
+    output_data = {
+        "character": char,
+        "general": gen,
+        "rating": rating,
+        "artist": artist
+    }
+    js.write_bytes(orjson.dumps(output_data, option=orjson.OPT_INDENT_2))
 
 def main(opts: ScriptOptions):
     dataloader, model, labels, group_tree = setup(
@@ -297,6 +359,7 @@ def main(opts: ScriptOptions):
     )
 
     init_worker(labels, group_tree, opts)
+    target_worker = save_json_output if opts.output_json else save_txt_output
 
     with ProcessPoolExecutor(
         max_workers=14,
@@ -310,7 +373,7 @@ def main(opts: ScriptOptions):
             outputs = run_model(model, img_inputs)
             tasks = [(img, paths[i]) for i, img in enumerate(outputs)]
 
-            list(executor.map(save_txt_output, tasks))
+            list(executor.map(target_worker, tasks))
 
 if __name__ == "__main__":
     parsed_opts, _ = parse_known_args(ScriptOptions)
