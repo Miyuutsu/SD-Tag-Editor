@@ -13,7 +13,6 @@ from PIL import Image, UnidentifiedImageError
 from simple_parsing import field, parse_known_args
 from timm.data.config import resolve_data_config
 from timm.data.transforms_factory import create_transform
-from torch.cuda import err
 from tqdm import tqdm
 from torch import Tensor, nn
 from torch.nn import functional as F
@@ -162,7 +161,7 @@ def prepare_inputs(model: str, image_or_images: str) -> tuple[str, Path]:
         repo_id = MODEL_REPO_MAP[model]
     except KeyError:
         print(f"Available models: {list(MODEL_REPO_MAP.keys())}")
-        raise ValueError(f"Unknown model name '{model}'") from err
+        raise ValueError(f"Unknown model name '{model}'") from None
     image_path = Path(image_or_images.strip(' "'))
     if image_path.name == "NO_INPUT":
         image_path = Path(input("Input folder or image: ").strip(' "'))
