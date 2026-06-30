@@ -45,7 +45,6 @@ class TaggerDataset(Dataset):
             img = pil_ensure_rgb(img)
             img = pil_pad_square(img)
             tensor = self.transform(img)
-            tensor = tensor[[2, 1, 0], :, :]  # BGR swap
             return tensor, str(path)
         except Exception as e:
             print(f"\n[WARNING] Skipping corrupt file: {path} - {e}")
@@ -186,6 +185,7 @@ def prepare_inputs(model: str, image_or_images: str) -> tuple[str, Path]:
         image_path = Path(input("Input folder or image: ").strip(' "'))
     return repo_id, image_path
 
+valid_extensions = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif", ".tiff"}
 
 def load_images(image_path: Path, subfolder: bool) -> list[Path]:
     if not image_path.exists():
@@ -198,7 +198,10 @@ def load_images(image_path: Path, subfolder: bool) -> list[Path]:
             raise UnidentifiedImageError(f"Unknown File Type of image: {image_path}") from e
 
     temp = list_files(image_path) if subfolder else [x for x in image_path.iterdir() if x.is_file()]
-    images: list[Path] = list(temp)
+    images: list[Path] = [
+        x for x in temp
+        if x.suffix.lower() in valid_extensions or x.suffix.lower() is None
+    ]
     return images
 
 def run_model(model: nn.Module, img_inputs: torch.Tensor) -> list[torch.Tensor]:
@@ -218,7 +221,7 @@ def run_model(model: nn.Module, img_inputs: torch.Tensor) -> list[torch.Tensor]:
         cpu_outputs = probabilistic_outputs
         if torch_device.type != "cpu":
             # 3. Move data location (Memory transformation)
-            cpu_outputs = probabilistic_outputs.to("cpu", non_blocking=True)
+            cpu_outputs = probabilistic_outputs.to("cpu")
 
     # Return the list of tensors
     return list(torch.unbind(cpu_outputs, dim=0))
