@@ -45,6 +45,7 @@ class TaggerDataset(Dataset):
             img = pil_ensure_rgb(img)
             img = pil_pad_square(img)
             tensor = self.transform(img)
+            tensor = tensor[[2, 1, 0], ...]
             return tensor, str(path)
         except Exception as e:
             print(f"\n[WARNING] Skipping corrupt file: {path} - {e}")
@@ -374,7 +375,7 @@ def main(opts: ScriptOptions):
             if len(paths) == 0:
                 continue
             outputs = run_model(model, img_inputs)
-            tasks = [(img, paths[i]) for i, img in enumerate(outputs)]
+            tasks = list(zip(outputs, paths, strict=True))
 
             list(executor.map(target_worker, tasks))
 
