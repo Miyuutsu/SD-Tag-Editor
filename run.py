@@ -14,7 +14,7 @@ from simple_parsing import field, parse_known_args
 from timm.data.config import resolve_data_config
 from timm.data.transforms_factory import create_transform
 from tqdm import tqdm
-from torch import Tensor, nn
+from torch import nn
 from torch.nn import functional as F
 from torch.utils.data import Dataset, DataLoader
 from torch.utils.data.dataloader import default_collate
@@ -57,19 +57,6 @@ def safe_collate(batch):
         return torch.empty(0), []
     return default_collate(batch)
 
-def list_files(path: Path) -> list[Path]:
-    folders = [path]
-    files = []
-    while folders:
-        folder = folders.pop(0)
-        for file in folder.iterdir():
-            if file.is_dir():
-                folders.append(file)
-                continue
-            files.append(file)
-    return files
-
-
 def pil_ensure_rgb(image: Image.Image) -> Image.Image:
     if image.mode not in ["RGB", "RGBA"]:
         image = image.convert("RGBA") if "transparency" in image.info else image.convert("RGB")
@@ -78,7 +65,6 @@ def pil_ensure_rgb(image: Image.Image) -> Image.Image:
         canvas.alpha_composite(image)
         image = canvas.convert("RGB")
     return image
-
 
 def pil_pad_square(image: Image.Image) -> Image.Image:
     w, h = image.size
@@ -141,12 +127,12 @@ def load_labels_hf(
     )
 
 def get_tags(
-    probs: Tensor,
+    probs: np.ndarray,
     labels: LabelData,
     gen_threshold: float,
     char_threshold: float,
 ):
-    prob_results = list(zip(labels.names, probs.numpy(), strict=True))
+    prob_results = list(zip(labels.names, probs, strict=True))
 
     gen_labels = [prob_results[i] for i in labels.general]
     gen_labels = {x[0]: x[1] for x in gen_labels if x[1] > gen_threshold}
@@ -198,14 +184,14 @@ def load_images(image_path: Path, subfolder: bool) -> list[Path]:
         except UnidentifiedImageError as e:
             raise UnidentifiedImageError(f"Unknown File Type of image: {image_path}") from e
 
-    temp = list_files(image_path) if subfolder else [x for x in image_path.iterdir() if x.is_file()]
+    temp = image_path.rglob('*') if subfolder else image_path.iterdir()
     images: list[Path] = [
         x for x in temp
         if x.suffix.lower() in valid_extensions or x.suffix.lower() is None
     ]
     return images
 
-def run_model(model: nn.Module, img_inputs: torch.Tensor) -> list[torch.Tensor]:
+def run_model(model: nn.Module, img_inputs: torch.Tensor) -> list[np.ndarray]:
     with torch.inference_mode():
         if torch_device.type != "cpu":
             img_inputs = img_inputs.to(
@@ -219,13 +205,9 @@ def run_model(model: nn.Module, img_inputs: torch.Tensor) -> list[torch.Tensor]:
         # 2. Convert to probabilities (Semantic transformation)
         probabilistic_outputs = F.sigmoid(raw_outputs)
 
-        cpu_outputs = probabilistic_outputs
-        if torch_device.type != "cpu":
-            # 3. Move data location (Memory transformation)
-            cpu_outputs = probabilistic_outputs.to("cpu")
+        cpu_outputs = probabilistic_outputs.cpu().numpy()
 
-    # Return the list of tensors
-    return list(torch.unbind(cpu_outputs, dim=0))
+    return list(cpu_outputs)
 
 
 def setup(
@@ -262,15 +244,19 @@ def setup(
 
     return dataloader, model, labels, group_tree
 
-WORKER_LABELS: LabelData
-WORKER_GROUP_TREE: GroupTree
-WORKER_OPTS: ScriptOptions
+class WorkerState:
+    """Container to hold process-local state without triggering global warnings."""
+    labels: LabelData
+    group_tree: GroupTree
+    opts: ScriptOptions
 
-def init_worker(labels, group_tree, opts):
-    global WORKER_LABELS, WORKER_GROUP_TREE, WORKER_OPTS
-    WORKER_LABELS = labels
-    WORKER_GROUP_TREE = group_tree
-    WORKER_OPTS = opts
+WORKER_STATE = WorkerState()
+
+def init_worker(labels: LabelData, group_tree: GroupTree, opts: ScriptOptions):
+    # Mutating attributes of an existing object does not require the 'global' keyword
+    WORKER_STATE.labels = labels
+    WORKER_STATE.group_tree = group_tree
+    WORKER_STATE.opts = opts
 
 def save_txt_output(args_tuple):
     """Worker function to process and save standard txt tags with prefixing logic."""
@@ -279,36 +265,36 @@ def save_txt_output(args_tuple):
     real_path = img_path.resolve() # Resolves the symlink to find the true parent directory
 
     char_labels, gen_labels, _ = get_tags(
-        probs=img_tensor, labels=WORKER_LABELS,
-        gen_threshold=WORKER_OPTS.gen_threshold, char_threshold=WORKER_OPTS.char_threshold
+        probs=img_tensor, labels=WORKER_STATE.labels,
+        gen_threshold=WORKER_STATE.opts.gen_threshold, char_threshold=WORKER_STATE.opts.char_threshold
     )
-    pruned = flatten_tags(prune(WORKER_GROUP_TREE, {str(x): float(y) for x, y in gen_labels.items()}), True)
+    pruned = flatten_tags(prune(WORKER_STATE.group_tree, {str(x): float(y) for x, y in gen_labels.items()}), True)
 
     # Format text
     pruned_formatted = [
-        str(x[0]).replace("_", " ") if WORKER_OPTS.noUnderscores else str(x[0])
+        str(x[0]).replace("_", " ") if WORKER_STATE.opts.noUnderscores else str(x[0])
         for x in sorted(pruned, key=lambda x: x[1], reverse=True)
     ]
-    if WORKER_OPTS.sortAlphabetically:
+    if WORKER_STATE.opts.sortAlphabetically:
         pruned_formatted = sorted(pruned_formatted)
 
     final_tags = []
 
     # 1. Inject Human-Verified Directory Artist (Never shadow prefixed)
-    if WORKER_OPTS.dir_as_artist:
+    if WORKER_STATE.opts.dir_as_artist:
         artist_name = real_path.parent.name.lower().replace(" ", "_")
-        if WORKER_OPTS.noUnderscores:
+        if WORKER_STATE.opts.noUnderscores:
             artist_name = artist_name.replace("_", " ")
         final_tags.append(f"artist:{artist_name}")
 
     # 2. Append AI Characters
     for c in char_labels:
-        char_tag = c.replace("_", " ") if WORKER_OPTS.noUnderscores else c
-        final_tags.append(f"{WORKER_OPTS.tag_prefix}{char_tag}")
+        char_tag = c.replace("_", " ") if WORKER_STATE.opts.noUnderscores else c
+        final_tags.append(f"{WORKER_STATE.opts.tag_prefix}{char_tag}")
 
     # 3. Append AI General Tags
     for g in pruned_formatted:
-        final_tags.append(f"{WORKER_OPTS.tag_prefix}{g}")
+        final_tags.append(f"{WORKER_STATE.opts.tag_prefix}{g}")
 
     pruned_str = ", ".join(final_tags)
     img_path.with_suffix(".txt").write_text(pruned_str, encoding="utf-8")
@@ -319,30 +305,30 @@ def save_json_output(args_tuple):
     real_path = Path(path_str).resolve()
 
     char, gen, rating = get_tags(
-        probs=img_tensor, labels=WORKER_LABELS,
-        gen_threshold=WORKER_OPTS.gen_threshold, char_threshold=WORKER_OPTS.char_threshold
+        probs=img_tensor, labels=WORKER_STATE.labels,
+        gen_threshold=WORKER_STATE.opts.gen_threshold, char_threshold=WORKER_STATE.opts.char_threshold
     )
     artist = []
 
-    pruned_gen_tuples = flatten_tags(prune(WORKER_GROUP_TREE, gen), True)
+    pruned_gen_tuples = flatten_tags(prune(WORKER_STATE.group_tree, gen), True)
 
     # Apply Optional Prefixes
-    prefix = WORKER_OPTS.tag_prefix
+    prefix = WORKER_STATE.opts.tag_prefix
     char = {f"{prefix}{str(k)}": float(v) for k, v in char.items()}
     gen = {f"{prefix}{str(k)}": float(v) for k, v in pruned_gen_tuples}
     rating = {str(k): float(v) for k, v in rating.items()}
 
     # Append the un-prefixed artist tag
-    if WORKER_OPTS.dir_as_artist:
+    if WORKER_STATE.opts.dir_as_artist:
         artist_name = real_path.parent.name.lower().replace(" ", "_")
         artist.append(artist_name)
 
     if js.is_file():
         data = orjson.loads(js.read_bytes())
         for x in data.get("character", {}):
-            char[x] = (char.get(x, WORKER_OPTS.char_threshold) + WORKER_OPTS.char_threshold) / 2
+            char[x] = (char.get(x, WORKER_STATE.opts.char_threshold) + WORKER_STATE.opts.char_threshold) / 2
         for x in data.get("general", {}):
-            gen[x] = (gen.get(x, WORKER_OPTS.gen_threshold) + WORKER_OPTS.gen_threshold) / 2
+            gen[x] = (gen.get(x, WORKER_STATE.opts.gen_threshold) + WORKER_STATE.opts.gen_threshold) / 2
 
         existing_artist = data.get("artist", [])
         for a in existing_artist:
@@ -362,8 +348,8 @@ def main(opts: ScriptOptions):
         opts.model, opts.image_or_images, opts.subfolder, opts.batch_size
     )
 
-    init_worker(labels, group_tree, opts)
     target_worker = save_json_output if opts.output_json else save_txt_output
+    futures = []
 
     with ProcessPoolExecutor(
         max_workers=14,
@@ -374,10 +360,13 @@ def main(opts: ScriptOptions):
         for img_inputs, paths in tqdm(dataloader):
             if len(paths) == 0:
                 continue
-            outputs = run_model(model, img_inputs)
-            tasks = list(zip(outputs, paths, strict=True))
 
-            list(executor.map(target_worker, tasks))
+            outputs = run_model(model, img_inputs)
+            for task in zip(outputs, paths, strict=True):
+                futures.append(executor.submit(target_worker, task))
+
+        for future in tqdm(futures, desc="Saving files"):
+            future.result()
 
 if __name__ == "__main__":
     parsed_opts, _ = parse_known_args(ScriptOptions)
