@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+import logging
 from pathlib import Path
 from concurrent.futures import ProcessPoolExecutor
 import numpy as np
@@ -6,6 +7,7 @@ import orjson
 import pandas as pd
 import timm
 import torch
+import warnings
 
 from huggingface_hub import hf_hub_download, constants
 from huggingface_hub.errors import HfHubHTTPError, LocalEntryNotFoundError
@@ -20,6 +22,9 @@ from torch.utils.data import Dataset, DataLoader
 from torch.utils.data.dataloader import default_collate
 
 from tag_tree_functions import GroupTree, flatten_tags, load_groups, prune
+
+warnings.filterwarnings("ignore", message=".*unauthenticated requests.*")
+logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
 
 torch_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 MODEL_REPO_MAP = {
@@ -87,8 +92,8 @@ def load_model_hf(repo_id: str) -> nn.Module:
         constants.HF_HUB_OFFLINE = True
         model = timm.create_model(f"hf-hub:{repo_id}", pretrained=True).eval()
 
-    except Exception as e:
-        print(f"[INFO] Cache miss or error: {e}")
+    except Exception:
+        print(f"[INFO] {repo_id} not found in local cache.")
         print(f"Downloading model weights for {repo_id}...")
         constants.HF_HUB_OFFLINE = False
         model = timm.create_model(f"hf-hub:{repo_id}", pretrained=True).eval()
