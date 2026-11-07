@@ -35,6 +35,8 @@ MODEL_REPO_MAP = {
     "eva02": "SmilingWolf/wd-eva02-large-tagger-v3",
 }
 
+Image.MAX_IMAGE_PIXELS = Image.MAX_IMAGE_PIXELS * 3
+
 class TaggerDataset(Dataset):
     def __init__(self, paths, transform):
         self.paths = paths
@@ -71,11 +73,15 @@ def pil_ensure_rgb(image: Image.Image) -> Image.Image:
         image = canvas.convert("RGB")
     return image
 
-def pil_pad_square(image: Image.Image) -> Image.Image:
+def pil_pad_square(image: Image.Image, target_size: int = 448) -> Image.Image:
     w, h = image.size
-    px = max(image.size)
-    canvas = Image.new("RGB", (px, px), (255, 255, 255))
-    canvas.paste(image, ((px - w) // 2, (px - h) // 2))
+    scale = target_size / max(w, h)
+    new_w = int(w * scale)
+    new_h = int(h * scale)
+    image = image.resize((new_w, new_h), Image.Resampling.BICUBIC)
+
+    canvas = Image.new("RGB", (target_size, target_size), (255, 255, 255))
+    canvas.paste(image, ((target_size - new_w) // 2, (target_size - new_h) // 2))
     return canvas
 
 
