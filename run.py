@@ -321,12 +321,10 @@ def save_json_output(args_tuple):
     )
     artist = []
 
-    pruned_gen_tuples = flatten_tags(prune(WORKER_STATE.group_tree, gen), True)
-
-    # Apply Optional Prefixes
+    # Apply Optional Prefixes (unpruned for JSON output)
     prefix = WORKER_STATE.opts.tag_prefix
     char = {f"{prefix}{str(k)}": float(v) for k, v in char.items()}
-    gen = {f"{prefix}{str(k)}": float(v) for k, v in pruned_gen_tuples}
+    gen = {f"{prefix}{str(k)}": float(v) for k, v in gen.items()}
     rating = {str(k): float(v) for k, v in rating.items()}
 
     # Append the un-prefixed artist tag
